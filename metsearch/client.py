@@ -103,12 +103,20 @@ class MetClient:
         self,
         query: str,
         *,
+        in_title: bool = False,
+        in_tags: bool = False,
         date_begin: int | None = None,
         date_end: int | None = None,
         offset: int = 0,
         limit: int = 500,
     ) -> SearchPage:
         params: dict[str, Any] = {"q": query, "offset": offset, "limit": limit}
+        # The API treats these as flags that limit `q` to one field. Other values,
+        # including text, are silently ignored.
+        if in_title:
+            params["title"] = "true"
+        if in_tags:
+            params["tags"] = "true"
         if date_begin is not None and date_end is not None:
             params["dateBegin"] = date_begin
             params["dateEnd"] = date_end

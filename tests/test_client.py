@@ -90,6 +90,18 @@ async def test_search_sends_date_window(client):
 
 
 @respx.mock
+async def test_search_sends_field_flags_only_when_asked(client):
+    route = respx.get(SEARCH_URL).respond(json={"total": 1, "objectIDs": [7]})
+    await client.search("x")
+    await client.search("x", in_title=True)
+    await client.search("x", in_tags=True)
+    plain, title, tags = (call.request.url.params for call in route.calls)
+    assert "title" not in plain and "tags" not in plain
+    assert title["title"] == "true" and "tags" not in title
+    assert tags["tags"] == "true" and "title" not in tags
+
+
+@respx.mock
 async def test_object_404_returns_none_without_retry(client):
     route = respx.get(OBJECT_URL).respond(404, json={"message": "ObjectID not found"})
     assert await client.get_object(1) is None

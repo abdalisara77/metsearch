@@ -49,7 +49,7 @@ def test_prints_table_and_summary(db, capsys):
     assert lines[0].split() == ["End", "date", "Title", "Artist", "URL"]
     assert "Work 2" in lines[2]
     assert "Work 1" in lines[3]
-    assert "2 matches" in captured.err
+    assert "up to 2 matches" in captured.err
 
 
 @respx.mock
@@ -100,6 +100,28 @@ def test_defaults_to_tessellation(db):
 
 
 @respx.mock
+def test_title_and_tags_are_sent_as_field_searches(db):
+    route = respx.get(SEARCH_URL).mock(side_effect=search_handler([1]))
+    mock_object(1, 1900)
+    assert main(["tile", "--title", "bowl", "--tags", "Flowers", *db]) == EXIT_OK
+    sent = {
+        (r.request.url.params["q"], r.request.url.params.get("title"), r.request.url.params.get("tags"))
+        for r in route.calls
+    }
+    assert sent == {("tile", None, None), ("bowl", "true", None), ("flowers", None, "true")}
+
+
+@respx.mock
+def test_title_and_tags_default_to_the_query(db):
+    route = respx.get(SEARCH_URL).mock(side_effect=search_handler([1]))
+    mock_object(1, 1900)
+    assert main(["tile", *db]) == EXIT_OK
+    assert {r.request.url.params["q"] for r in route.calls} == {"tile"}
+    assert any("title" in r.request.url.params for r in route.calls)
+    assert any("tags" in r.request.url.params for r in route.calls)
+
+
+@respx.mock
 def test_no_results_exits_zero(db, capsys):
     respx.get(SEARCH_URL).mock(side_effect=search_handler([]))
     assert main(["nothing", *db]) == EXIT_OK
@@ -122,7 +144,7 @@ def test_firewall_block_exit_code(db, capsys):
 
 @pytest.mark.parametrize(
     "bad_args",
-    [["--limit", "0"], ["--rate", "81"], ["--rate", "0"], ["   "]],
+    [["--limit", "0"], ["--rate", "81"], ["--rate", "0"], ["   "], ["--title", " "], ["--tags", " "]],
 )
 def test_invalid_arguments(db, bad_args):
     with pytest.raises(SystemExit) as exit_info:

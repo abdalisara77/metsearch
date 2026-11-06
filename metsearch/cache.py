@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 QUERY_TTL = timedelta(hours=24)  # search results can change
 OBJECT_TTL = timedelta(days=30)  # object records rarely do
 _SQL_BATCH = 500  # stays well under SQLite's bound-variable limit
@@ -30,6 +30,7 @@ CREATE TABLE queries (
     query        TEXT PRIMARY KEY,
     total        INTEGER NOT NULL,
     window_begin INTEGER,
+    exhausted    INTEGER NOT NULL DEFAULT 0,
     checked_at   TEXT NOT NULL
 );
 
@@ -44,9 +45,10 @@ CREATE TABLE query_objects (
 
 @dataclass(frozen=True)
 class QueryRecord:
-    total: int  # matches across all dates
+    total: int  # the most matches this query can have, across all dates
     # The start year of the finished window. None means no walk has finished yet.
     window_begin: int | None
+    exhausted: bool  # widening the window further can't find anything new
 
 
 @dataclass(frozen=True)
@@ -94,15 +96,15 @@ class Cache:
     def get_query(self, query: str) -> QueryRecord | None:
         """Return the query's record. An expired one is deleted and reported as absent."""
         row = self._db.execute(
-            "SELECT total, window_begin, checked_at FROM queries WHERE query = ?",
+            "SELECT total, window_begin, exhausted, checked_at FROM queries WHERE query = ?",
             (query,),
         ).fetchone()
         if row is None:
             return None
-        if datetime.fromisoformat(row[2]) < self._now() - QUERY_TTL:
+        if datetime.fromisoformat(row[3]) < self._now() - QUERY_TTL:
             self.forget_query(query)
             return None
-        return QueryRecord(total=row[0], window_begin=row[1])
+        return QueryRecord(total=row[0], window_begin=row[1], exhausted=bool(row[2]))
 
     def save_query(self, query: str, total: int) -> None:
         with self._db:
@@ -123,13 +125,18 @@ class Cache:
         return {row[0] for row in rows}
 
     def save_window(
-        self, query: str, window_begin: int, object_ids: Iterable[int]
+        self,
+        query: str,
+        window_begin: int,
+        object_ids: Iterable[int],
+        *,
+        exhausted: bool = False,
     ) -> None:
         """Record a finished walk: where its window began, and the objects in it."""
         with self._db:
             self._db.execute(
-                "UPDATE queries SET window_begin = ? WHERE query = ?",
-                (window_begin, query),
+                "UPDATE queries SET window_begin = ?, exhausted = ? WHERE query = ?",
+                (window_begin, exhausted, query),
             )
             self._db.execute("DELETE FROM query_objects WHERE query = ?", (query,))
             self._db.executemany(

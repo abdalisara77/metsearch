@@ -1,9 +1,12 @@
 """Find a query's most recent works by widening a date window back from this year.
 
+A work must match three searches: the query anywhere, a title term in the title, and
+a tags term in the subject tags. The title and tags terms default to the query.
+
 The API can't sort by date, so we search current_year-1..current_year, then
-current_year-2..current_year, and so on. Once a window holds enough IDs, we fetch them
-to check they're real, because search can list IDs whose records are gone. The walk
-stops when enough have a record and an end date, then ranks them by end date.
+current_year-2..current_year, and so on. Once a window holds enough works matching all
+three, we fetch them to check they're real, because search can list IDs whose records
+are gone. The walk stops when enough have a record and an end date, then ranks them.
 
 The API only returns an object if its whole date range fits inside the window. A
 work that began before the window therefore isn't found, even if it ended recently.
@@ -14,11 +17,12 @@ be the most recent by end date across every match.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .cache import Artwork, Cache
-from .client import ApiError, MetClient, MetSearchError
+from .client import ApiError, MetClient, MetSearchError, SearchPage
 
 MAX_RESULTS = 10_000  # the query limit the project brief sets
 PAGE_SIZE = 500  # the API's maximum
@@ -43,8 +47,22 @@ class SearchResult:
     from_cache: bool
 
 
+@dataclass(frozen=True)
+class _Search:
+    term: str
+    in_title: bool = False
+    in_tags: bool = False
+
+
 def normalize_query(query: str) -> str:
     return " ".join(query.split()).casefold()
+
+
+def cache_key(query: str, title: str | None = None, tags: str | None = None) -> str:
+    query = normalize_query(query)
+    title = normalize_query(title) if title else query
+    tags = normalize_query(tags) if tags else query
+    return json.dumps([query, title, tags])
 
 
 async def find_recent(
@@ -52,71 +70,80 @@ async def find_recent(
     cache: Cache,
     query: str,
     *,
+    title: str | None = None,
+    tags: str | None = None,
     limit: int = 5,
     refresh: bool = False,
     current_year: int | None = None,
 ) -> SearchResult:
-    query = normalize_query(query)
+    key = cache_key(query, title, tags)
+    query, title, tags = json.loads(key)
     if refresh:
-        cache.forget_query(query)
+        cache.forget_query(key)
 
-    record = cache.get_query(query)
+    record = cache.get_query(key)
     if record is not None and record.window_begin is not None:
-        cached = cache.top_objects(query, limit=limit)
-        enough_dated = sum(artwork.found for artwork in cached) >= limit
-        walk_exhausted = (
-            len(cache.query_ids(query)) >= record.total
-            or record.window_begin <= EARLIEST_YEAR
-        )
-        if enough_dated or walk_exhausted:
+        cached = cache.top_objects(key, limit=limit)
+        if sum(artwork.found for artwork in cached) >= limit or record.exhausted:
             return SearchResult(
-                cached, record.total, 0, cache.count_unusable(query), from_cache=True
+                cached, record.total, 0, cache.count_unusable(key), from_cache=True
             )
 
-    if record is not None:
-        total = record.total
-    else:
-        total = (await client.search(query, limit=1)).total
-        if total > MAX_RESULTS:
-            raise TooManyResultsError(total)
-        if total == 0:
+    searches = [_Search(query), _Search(title, in_title=True), _Search(tags, in_tags=True)]
+    totals = {}
+    for search in searches:
+        totals[search] = (await _search_page(client, search, limit=1)).total
+        if totals[search] > MAX_RESULTS:
+            raise TooManyResultsError(totals[search])
+        if totals[search] == 0:  # nothing can match all three
             return SearchResult([], 0, 0, 0, from_cache=False)
-        cache.save_query(query, total)
+
+    # The narrowest search is listed first, so most years cost only one request.
+    narrowest, *others = sorted(searches, key=totals.__getitem__)
+    total = totals[narrowest]
+    cache.save_query(key, total)
 
     year = current_year if current_year is not None else datetime.now(timezone.utc).year
-    wanted = min(limit, total)
     fetched: set[int] = set()
     begin = year - 1
     while True:
-        object_ids = await _list_ids(client, query, begin, year)
-        at_floor = begin <= EARLIEST_YEAR
-        # A window with too few IDs can't hold enough real works, so skip fetching it.
-        if len(object_ids) >= wanted or at_floor:
-            to_fetch = object_ids - fetched
-            if not refresh:
-                to_fetch = set(cache.stale_object_ids(to_fetch))
-            await _fetch_objects(client, cache, to_fetch)
-            fetched |= to_fetch
-            if (
-                cache.count_dated(object_ids) >= limit
-                or len(object_ids) >= total
-                or at_floor
-            ):
-                break
+        object_ids = await _list_ids(client, narrowest, begin, year)
+        # Every match is also a match of the narrowest search. Once its full list is
+        # inside the window, or no earlier year exists, widening can't find more.
+        exhausted = len(object_ids) >= total or begin <= EARLIEST_YEAR
+        if len(object_ids) >= limit or exhausted:
+            for search in others:
+                object_ids &= await _list_ids(client, search, begin, year)
+            if len(object_ids) >= limit or exhausted:
+                to_fetch = object_ids - fetched
+                if not refresh:
+                    to_fetch = set(cache.stale_object_ids(to_fetch))
+                await _fetch_objects(client, cache, to_fetch)
+                fetched |= to_fetch
+                if cache.count_dated(object_ids) >= limit or exhausted:
+                    break
         begin = max(begin - 1, EARLIEST_YEAR)
 
     # Recorded only now, so an interrupted run can't pass for a finished one.
-    cache.save_window(query, begin, object_ids)
+    cache.save_window(key, begin, object_ids, exhausted=exhausted)
     return SearchResult(
-        cache.top_objects(query, limit=limit),
+        cache.top_objects(key, limit=limit),
         total,
         len(fetched),
-        cache.count_unusable(query),
+        cache.count_unusable(key),
         from_cache=False,
     )
 
 
-async def _list_ids(client: MetClient, query: str, begin: int, end: int) -> set[int]:
+async def _search_page(
+    client: MetClient, search: _Search, **kwargs: int
+) -> SearchPage:
+    return await client.search(
+        search.term, in_title=search.in_title, in_tags=search.in_tags, **kwargs
+    )
+
+
+async def _list_ids(client: MetClient, search: _Search, begin: int, end: int) -> set[int]:
     """Collect every ID in a window, and check that none were lost while paging.
 
     The API's result order isn't stable between requests. A lost ID could silently
@@ -125,8 +152,8 @@ async def _list_ids(client: MetClient, query: str, begin: int, end: int) -> set[
     ids: set[int] = set()
     offset = 0
     while True:
-        page = await client.search(
-            query, date_begin=begin, date_end=end, offset=offset, limit=PAGE_SIZE
+        page = await _search_page(
+            client, search, date_begin=begin, date_end=end, offset=offset, limit=PAGE_SIZE
         )
         ids.update(page.object_ids)
         offset += PAGE_SIZE

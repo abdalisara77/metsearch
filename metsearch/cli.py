@@ -62,6 +62,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="search term (default: %(default)s)",
     )
     parser.add_argument(
+        "--title", type=_query, help="term that must be in the title (default: the query)"
+    )
+    parser.add_argument(
+        "--tags", type=_query, help="term that must be in the tags (default: the query)"
+    )
+    parser.add_argument(
         "--limit", type=_positive_int, default=5,
         help="how many works to return (default: %(default)s)",
     )
@@ -86,6 +92,8 @@ async def _run(args: argparse.Namespace, cache: Cache) -> tuple[SearchResult, in
             client,
             cache,
             args.query,
+            title=args.title,
+            tags=args.tags,
             limit=args.limit,
             refresh=args.refresh,
         )
@@ -140,7 +148,7 @@ def _print_result(result: SearchResult, requests: int, *, as_json: bool) -> None
     # On stderr, so piped output holds only the results.
     source = "cache" if result.from_cache else f"{requests} requests"
     print(
-        f"{result.total:,} matches, {len(result.artworks)} shown, from {source}, "
+        f"up to {result.total:,} matches, {len(result.artworks)} shown, from {source}, "
         f"{result.objects_fetched} objects fetched, {result.unusable} unusable",
         file=sys.stderr,
     )

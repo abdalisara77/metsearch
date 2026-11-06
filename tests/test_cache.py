@@ -44,6 +44,13 @@ def test_query_round_trip(cache):
     assert cache.query_ids("q") == {1}
 
 
+def test_exhausted_flag_round_trip(cache):
+    cache.save_query("q", 0)
+    assert not cache.get_query("q").exhausted
+    cache.save_window("q", 1999, [], exhausted=True)
+    assert cache.get_query("q").exhausted
+
+
 def test_expired_query_is_deleted_with_its_links(cache, clock):
     cache.save_query("q", 1)
     cache.save_object(1, record(1, 2000))
